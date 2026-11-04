@@ -1,0 +1,15 @@
+[package]
+name = "feature_rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "feature_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+polars = { version = "0.54.4", default-features = false }
+pyo3 = { version = "0.28", features = ["extension-module", "abi3-py310"] }
+pyo3-polars = { version = "0.27.0", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
