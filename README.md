@@ -114,12 +114,12 @@ uv run python examples/minimal.py --days 30 --data /tmp/gp          # train
 ```
 
 Peak RSS of the training run (Linux, Polars 2.0, pure-Polars EWMA, 4M rows
-per day; Polars 1.41 needs about 40 MiB less):
+per day, files in the page cache; Polars 1.41 needs about 30 MiB less):
 
 | Days | Parquet on disk | Test rows | Peak RSS |
 | ---: | ---: | ---: | ---: |
-| 10 | 409 MiB | 8.0M | ~530 MiB |
-| 30 | 1228 MiB | 23.9M | ~530 MiB |
+| 10 | 409 MiB | 8.0M | ~440 MiB |
+| 30 | 1228 MiB | 23.9M | ~440 MiB |
 
 Tripling the data leaves memory flat.
 

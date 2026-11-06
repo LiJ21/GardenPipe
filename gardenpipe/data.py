@@ -1183,14 +1183,7 @@ class FeatureLoader:
         pad_ns = self._max_horizon_ns()
         engine = _streamed_engine(hint.polars_engine)
         group_max_times = self._target_group_max_times(scan(), engine)
-        times = (
-            df.get_column("t")
-            for df in scan().select(_epoch_ns(self.target_time).alias("t")).collect_batches(
-                chunk_size=hint.batch_size,
-                maintain_order=True,
-                engine=engine,
-            )
-        )
+        times = self._time_chunks(scan, hint.batch_size, engine)
         for start, stop, end_t_ns in _time_windows(
             times, hint.batch_size, f"{name} ({self.target_time})"
         ):
@@ -1214,6 +1207,28 @@ class FeatureLoader:
                 carryovers,
                 in_memory=hint.polars_engine == "in-memory",
             )
+
+    def _time_chunks(
+        self, scan: Callable[[], pl.LazyFrame], chunk_size: int, engine: str
+    ) -> Iterator[pl.Series]:
+        """The times of a date, a chunk at a time, each chunk its own query.
+
+        A query held open across the date would read ahead through the file,
+        by an amount that grows with the file.
+        """
+        offset = 0
+        while True:
+            chunk = (
+                scan()
+                .select(_epoch_ns(self.target_time).alias("t"))
+                .slice(offset, chunk_size)
+                .collect(engine=engine)
+                .get_column("t")
+            )
+            if chunk.is_empty():
+                return
+            yield chunk
+            offset += len(chunk)
 
     def _filter_window(
         self,
