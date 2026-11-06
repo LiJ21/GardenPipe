@@ -1239,15 +1239,18 @@ class FeatureLoader:
         front_start = start - actual_front_pad
         # On the bare column, in its own type: an expression over the column
         # would stop Parquet statistics from skipping the row groups beyond
-        # the window, and each window would read to the end of the file.
+        # the window, and each window would read to the end of the file. Only
+        # where the bound is exact in that type: strings do not sort as times,
+        # and a narrow integer may not hold the bound.
         dtype = lf.collect_schema()[self.target_time]
-        last = pl.lit(end_t_ns + pad_ns).cast(
-            pl.Datetime("ns", getattr(dtype, "time_zone", None))
-        )
-        return lf.filter(
-            (pl.col("__load_row") >= front_start)
-            & (pl.col(self.target_time) <= last.cast(dtype))
-        )
+        if isinstance(dtype, pl.Datetime) or dtype in (pl.Date, pl.Int64):
+            last = pl.lit(end_t_ns + pad_ns).cast(
+                pl.Datetime("ns", getattr(dtype, "time_zone", None))
+            )
+            in_window = pl.col(self.target_time) <= last.cast(dtype)
+        else:
+            in_window = _epoch_ns(self.target_time) <= end_t_ns + pad_ns
+        return lf.filter((pl.col("__load_row") >= front_start) & in_window)
 
     def _target_group_max_times(
         self, raw: pl.LazyFrame, polars_engine: str
