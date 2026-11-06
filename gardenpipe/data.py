@@ -1222,9 +1222,16 @@ class FeatureLoader:
     ) -> pl.LazyFrame:
         start, _, end_t_ns, pad_ns, actual_front_pad, _ = window
         front_start = start - actual_front_pad
+        # On the bare column, in its own type: an expression over the column
+        # would stop Parquet statistics from skipping the row groups beyond
+        # the window, and each window would read to the end of the file.
+        dtype = lf.collect_schema()[self.target_time]
+        last = pl.lit(end_t_ns + pad_ns).cast(
+            pl.Datetime("ns", getattr(dtype, "time_zone", None))
+        )
         return lf.filter(
             (pl.col("__load_row") >= front_start)
-            & (_epoch_ns(self.target_time) <= end_t_ns + pad_ns)
+            & (pl.col(self.target_time) <= last.cast(dtype))
         )
 
     def _target_group_max_times(
