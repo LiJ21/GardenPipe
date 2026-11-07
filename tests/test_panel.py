@@ -18,7 +18,9 @@ from gardenpipe.data import (
     FeatureLoader,
     LoadHint,
     MultiSourceLoader,
+    _epoch_ns,
     _stateful_internal_cols,
+    _time_span,
     _time_windows,
     _union_window_ends,
     scan_labels,
@@ -141,6 +143,61 @@ class TimeWindowTest(unittest.TestCase):
                     self.assertGreater(len(rows), 0)
                     self.assertTrue(len(rows) <= batch_size or len(set(rows)) == 1)
                     lo = end
+
+
+class TimeSpanTest(unittest.TestCase):
+    """The window filter of both loaders compares the bare column, in its own
+    type, with bounds given in epoch ns. A bound between two ticks of a coarse
+    column is rounded, and the rows must still be those of an exact comparison:
+    before 1970 too, where rounding down and rounding towards zero differ."""
+
+    KINDS = {
+        "ns": pl.Datetime("ns"),
+        "us": pl.Datetime("us"),
+        "ms": pl.Datetime("ms"),
+        "ms, UTC": pl.Datetime("ms", "UTC"),
+        "us, Asia/Tokyo": pl.Datetime("us", "Asia/Tokyo"),
+        "date": pl.Date,
+        "int64": pl.Int64,
+    }
+
+    def column(self, ns: pl.Series, dtype: pl.DataType) -> pl.Series:
+        if dtype == pl.Int64:
+            return ns.cast(pl.Int64)
+        if getattr(dtype, "time_zone", None):
+            zoned = ns.dt.replace_time_zone("UTC").dt.convert_time_zone(dtype.time_zone)
+            return zoned.dt.cast_time_unit(dtype.time_unit)
+        return ns.cast(dtype)
+
+    def test_rows_match_an_exact_comparison(self) -> None:
+        day = 86_400 * 10**9
+        rng = np.random.default_rng(5)
+        for era, start in (
+            ("2026", T0),
+            ("1960", dt.datetime(1960, 1, 5)),
+            ("across 1970", dt.datetime(1969, 12, 28)),
+        ):
+            t0 = (start - dt.datetime(1970, 1, 1)) // dt.timedelta(microseconds=1) * 1_000
+            ns = pl.Series(t0 + np.sort(rng.integers(0, 10 * day, 200))).cast(pl.Datetime("ns"))
+            for kind, dtype in self.KINDS.items():
+                with self.subTest(era=era, kind=kind):
+                    lf = pl.LazyFrame({"time": self.column(ns, dtype)}).with_row_index("i")
+                    exact = lf.select(_epoch_ns("time")).collect().to_series().to_numpy()
+                    # On a tick, a nanosecond either side, half a millisecond
+                    # either side, and anywhere in the span or just outside it.
+                    on = rng.choice(exact, 40)
+                    bounds = np.concatenate(
+                        [on + step for step in (0, -1, 1, -500_000, 500_000)]
+                        + [rng.integers(exact[0] - day, exact[-1] + day, 40)]
+                    )
+                    for _ in range(100):
+                        lo, hi = (int(b) for b in np.sort(rng.choice(bounds, 2)))
+                        after = None if rng.random() < 0.2 else lo
+                        rows = lf.filter(_time_span(lf, "time", after, hi)).collect()
+                        keep = exact <= hi if after is None else (exact > after) & (exact <= hi)
+                        self.assertEqual(
+                            rows["i"].to_list(), np.flatnonzero(keep).tolist(), (after, hi)
+                        )
 
 
 class SharedFileTest(unittest.TestCase):
@@ -449,6 +506,55 @@ class PerFileTest(unittest.TestCase):
                     self.assertGreater(len(batched), 4)
                     assert_frame_equal(pl.concat(batched), whole)
 
+
+
+class MixedUnitTest(unittest.TestCase):
+    """One file per stream, each in its own time unit. Window ends come from
+    every stream, so an end from the nanosecond stream falls between the ticks
+    of the others, and their bounds are rounded: no row may be lost or repeated,
+    before 1970 too."""
+
+    UNITS = {"A": "ns", "B": "us", "C": "ms"}
+
+    def write(self, root: Path, start: dt.datetime, rng: np.random.Generator) -> None:
+        t0 = (start - dt.datetime(1970, 1, 1)) // dt.timedelta(microseconds=1) * 1_000
+        for label, unit in self.UNITS.items():
+            # 300 rows in one second, so a coarse stream often has a row
+            # just after an end that came from a finer one.
+            ns = t0 + np.sort(rng.integers(0, 10**9, 300))
+            pl.DataFrame(
+                {
+                    "time": pl.Series(ns).cast(pl.Datetime("ns")).cast(pl.Datetime(unit)),
+                    "level": rng.normal(size=300).cumsum(),
+                }
+            ).write_parquet(root / f"{label}_{DATES[0]}.parquet", row_group_size=32)
+
+    def test_windows_hold_every_row_of_each_stream(self) -> None:
+        rng = np.random.default_rng(11)
+        for era, start in (("2026", T0), ("1960", dt.datetime(1960, 1, 5))):
+            with tempfile.TemporaryDirectory() as tmp:
+                self.write(Path(tmp), start, rng)
+                for horizon in ("100ms", "1500us"):
+                    base = FeatureLoader(
+                        path=f"{tmp}/{{source}}_{{date}}.parquet",
+                        feature_exprs={"level": pl.col("level")},
+                        targets={"y": pl.col("level")},
+                        horizons=horizon,
+                    )
+                    loader = MultiSourceLoader(list(self.UNITS), base, layout="long")
+                    whole = loader.load_dates([DATES[0]])[0].lf.collect()
+                    for batch_size in (7, 50):
+                        with self.subTest(era=era, horizon=horizon, batch_size=batch_size):
+                            windows = collect_windows(loader, DATES[0], batch_size)
+                            self.assertGreater(len(windows), 2)
+                            out = pl.concat(windows)
+                            # The long layout puts every stream in the coarsest
+                            # unit, where rows of different streams can tie, so
+                            # only the order within each stream is compared.
+                            for label in self.UNITS:
+                                part = out.filter(pl.col("source") == label)
+                                self.assertEqual(part.height, 300)
+                                assert_frame_equal(part, whole.filter(pl.col("source") == label))
 
 
 class StreamEdgeTest(unittest.TestCase):
