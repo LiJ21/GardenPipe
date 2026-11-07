@@ -189,6 +189,55 @@ def _epoch_ns(col: str) -> pl.Expr:
     return pl.col(col).cast(pl.Datetime("ns")).dt.epoch("ns")
 
 
+def _time_span(lf: pl.LazyFrame, time: str, after: int | None, last: int) -> pl.Expr:
+    """Rows with ``after < time <= last``, both in epoch ns.
+
+    On the bare column, in its own type: an expression over the column would
+    stop Parquet statistics from skipping the row groups outside the span, and
+    each read would go through the whole file. Only where the bounds are exact
+    in that type: strings do not sort as times, and a narrow integer may not
+    hold them.
+    """
+    dtype = lf.collect_schema()[time]
+    if isinstance(dtype, pl.Datetime) or dtype in (pl.Date, pl.Int64):
+        t = pl.col(time)
+        as_time = pl.Datetime("ns", getattr(dtype, "time_zone", None))
+
+        def bound(ns: int) -> pl.Expr:
+            return pl.lit(ns).cast(as_time).cast(dtype)
+    else:
+        t = _epoch_ns(time)
+        bound = pl.lit
+    upper = t <= bound(last)
+    return upper if after is None else (t > bound(after)) & upper
+
+
+def _time_chunks(
+    scan: Callable[[], pl.LazyFrame],
+    time: str,
+    chunk_size: int,
+    engine: str,
+    keep: pl.Expr | None = None,
+) -> Iterator[pl.Series]:
+    """The times of a date, a chunk at a time, each chunk its own query.
+
+    A query held open across the date would read ahead through the file, by
+    an amount that grows with the file. ``keep`` drops rows after the slice:
+    in front of it, a filter would stop the slice from going straight to its
+    place in the file, and each chunk would read from the start.
+    """
+    columns = [_epoch_ns(time).alias("t")]
+    if keep is not None:
+        columns.append(keep.alias("keep"))
+    offset = 0
+    while True:
+        rows = scan().select(columns).slice(offset, chunk_size).collect(engine=engine)
+        if rows.is_empty():
+            return
+        offset += rows.height
+        yield rows.get_column("t") if keep is None else rows.filter("keep").get_column("t")
+
+
 def _time_windows(
     chunks: Iterable[pl.Series], batch_size: int, name: str
 ) -> Iterator[tuple[int, int, int]]:
@@ -1183,7 +1232,7 @@ class FeatureLoader:
         pad_ns = self._max_horizon_ns()
         engine = _streamed_engine(hint.polars_engine)
         group_max_times = self._target_group_max_times(scan(), engine)
-        times = self._time_chunks(scan, hint.batch_size, engine)
+        times = _time_chunks(scan, self.target_time, hint.batch_size, engine)
         for start, stop, end_t_ns in _time_windows(
             times, hint.batch_size, f"{name} ({self.target_time})"
         ):
@@ -1208,28 +1257,6 @@ class FeatureLoader:
                 in_memory=hint.polars_engine == "in-memory",
             )
 
-    def _time_chunks(
-        self, scan: Callable[[], pl.LazyFrame], chunk_size: int, engine: str
-    ) -> Iterator[pl.Series]:
-        """The times of a date, a chunk at a time, each chunk its own query.
-
-        A query held open across the date would read ahead through the file,
-        by an amount that grows with the file.
-        """
-        offset = 0
-        while True:
-            chunk = (
-                scan()
-                .select(_epoch_ns(self.target_time).alias("t"))
-                .slice(offset, chunk_size)
-                .collect(engine=engine)
-                .get_column("t")
-            )
-            if chunk.is_empty():
-                return
-            yield chunk
-            offset += len(chunk)
-
     def _filter_window(
         self,
         lf: pl.LazyFrame,
@@ -1237,19 +1264,7 @@ class FeatureLoader:
     ) -> pl.LazyFrame:
         start, _, end_t_ns, pad_ns, actual_front_pad, _ = window
         front_start = start - actual_front_pad
-        # On the bare column, in its own type: an expression over the column
-        # would stop Parquet statistics from skipping the row groups beyond
-        # the window, and each window would read to the end of the file. Only
-        # where the bound is exact in that type: strings do not sort as times,
-        # and a narrow integer may not hold the bound.
-        dtype = lf.collect_schema()[self.target_time]
-        if isinstance(dtype, pl.Datetime) or dtype in (pl.Date, pl.Int64):
-            last = pl.lit(end_t_ns + pad_ns).cast(
-                pl.Datetime("ns", getattr(dtype, "time_zone", None))
-            )
-            in_window = pl.col(self.target_time) <= last.cast(dtype)
-        else:
-            in_window = _epoch_ns(self.target_time) <= end_t_ns + pad_ns
+        in_window = _time_span(lf, self.target_time, None, end_t_ns + pad_ns)
         return lf.filter((pl.col("__load_row") >= front_start) & in_window)
 
     def _target_group_max_times(
@@ -1362,6 +1377,8 @@ class _Date:
     front_pad: int = 0
     max_times: pl.DataFrame | None = None
     max_time_cols: tuple[str, ...] = ()
+    file_scan: Callable[[], pl.LazyFrame] | None = None
+    universe: pl.Expr | None = None
 
 
 @dataclass
@@ -1514,6 +1531,7 @@ class MultiSourceLoader:
             loader = self.loader
             file_scan, tag, name = loader._resolve(d, loader.source)
             scan = file_scan
+            universe = None
             if self.sources:
                 universe = pl.col(self.label_col).is_in(self.sources)
                 scan = lambda: file_scan().filter(universe)  # noqa: E731
@@ -1525,6 +1543,8 @@ class MultiSourceLoader:
                 {},
                 scan=scan,
                 front_pad=max(loader.front_pad, hint_pad),
+                file_scan=file_scan,
+                universe=universe,
             )
             if hint is not None and loader.targets:
                 raw = scan()
@@ -1671,8 +1691,10 @@ class MultiSourceLoader:
         self._warn_unseen(date)
 
     def _window_ends(self, date: _Date, batch_size: int, engine: str) -> list[int]:
+        keep = None
         if date.scan is not None:
-            sources = [(date.scan, self.loader.target_time, date.name)]
+            sources = [(date.file_scan, self.loader.target_time, date.name)]
+            keep = date.universe
         else:
             sources = [
                 (stream.scan, stream.loader.target_time, f"{stream.label!r} on {date.d}")
@@ -1680,12 +1702,7 @@ class MultiSourceLoader:
             ]
         if len(sources) == 1:
             scan, time, name = sources[0]
-            chunks = (
-                df.get_column("t")
-                for df in scan().select(_epoch_ns(time).alias("t")).collect_batches(
-                    chunk_size=batch_size, maintain_order=True, engine=engine
-                )
-            )
+            chunks = _time_chunks(scan, time, batch_size, engine, keep)
             return [end for _, _, end in _time_windows(chunks, batch_size, f"{name} ({time})")]
         step = min(_time_step_ns(scan().collect_schema()[time]) for scan, time, _ in sources)
         times = [scan().select(_epoch_ns(time).alias("t")) for scan, time, _ in sources]
@@ -1699,14 +1716,14 @@ class MultiSourceLoader:
         engine: str,
         pool: ThreadPoolExecutor | None,
     ) -> dict[Any, pl.DataFrame | None]:
-        def span(loader: FeatureLoader) -> pl.Expr:
-            t = _epoch_ns(loader.target_time)
-            upper = t <= end + loader._max_horizon_ns()
-            return upper if prev is None else (t > prev) & upper
+        def read(scan: Callable[[], pl.LazyFrame], loader: FeatureLoader) -> pl.DataFrame:
+            lf = scan()
+            last = end + loader._max_horizon_ns()
+            return lf.filter(_time_span(lf, loader.target_time, prev, last)).collect(engine=engine)
 
         if date.scan is not None:
             loader = self.loader
-            rows = date.scan().filter(span(loader)).collect(engine=engine)
+            rows = read(date.scan, loader)
             pad_ns = loader._max_horizon_ns()
             return self._run(
                 lambda task: self._stream_window(date.d, task[0], task[1], end, pad_ns),
@@ -1715,7 +1732,7 @@ class MultiSourceLoader:
             )
 
         def one(stream: _Stream) -> pl.DataFrame | None:
-            rows = stream.scan().filter(span(stream.loader)).collect(engine=engine)
+            rows = read(stream.scan, stream.loader)
             pad_ns = stream.loader._max_horizon_ns()
             return self._stream_window(date.d, stream, rows, end, pad_ns)
 
